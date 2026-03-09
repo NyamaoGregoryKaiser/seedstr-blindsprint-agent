@@ -113,6 +113,11 @@ export interface GenerateOptions {
   maxTokens?: number;
   temperature?: number;
   tools?: boolean;
+  /**
+   * If true, keep the current in-memory ProjectBuilder (create_file edits the same project).
+   * This enables a build → critique → repair loop without losing files between calls.
+   */
+  preserveProjectBuilder?: boolean;
 }
 
 /**
@@ -398,12 +403,15 @@ export class LLMClient {
       maxTokens = this.maxTokens,
       temperature = this.temperature,
       tools: enableTools = true,
+      preserveProjectBuilder = false,
     } = options;
 
     logger.debug(`Generating response with model: ${this.model}`);
 
-    // Reset project builder for each generation
-    activeProjectBuilder = null;
+    // Reset project builder unless explicitly preserving it (multi-pass refinement)
+    if (!preserveProjectBuilder) {
+      activeProjectBuilder = null;
+    }
 
     const tools = enableTools ? this.getTools() : undefined;
     const hasTools = tools && Object.keys(tools).length > 0;
@@ -498,7 +506,7 @@ export class LLMClient {
         maxTokens,
         temperature,
         tools: hasTools ? tools : undefined,
-        maxSteps: hasTools ? 10 : 1, // Allow up to 10 tool call steps
+        maxSteps: hasTools ? 30 : 1, // Allow enough tool steps for multi-file projects
         onStepFinish: (step) => {
           // Debug logging for each step
           logger.debug(`Step finished - finishReason: ${step.finishReason}, hasText: ${!!step.text}, toolCalls: ${step.toolCalls?.length || 0}`);

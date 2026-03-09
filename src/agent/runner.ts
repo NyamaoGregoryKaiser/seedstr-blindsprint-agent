@@ -6,6 +6,7 @@ import { getLLMClient } from "../llm/client.js";
 import { getConfig, configStore } from "../config/index.js";
 import { logger } from "../utils/logger.js";
 import { cleanupProject } from "../tools/projectBuilder.js";
+import { runSubmissionGuard, type ProjectMode } from "../tools/submissionGuardTool.js";
 import type { Job, AgentEvent, TokenUsage, FileAttachment, WebSocketJobEvent } from "../types/index.js";
 
 // Approximate costs per 1M tokens for common models (input/output)
@@ -29,6 +30,196 @@ function estimateCost(model: string, promptTokens: number, completionTokens: num
   const inputCost = (promptTokens / 1_000_000) * costs.input;
   const outputCost = (completionTokens / 1_000_000) * costs.output;
   return inputCost + outputCost;
+}
+
+function inferProjectMode(files: string[]): ProjectMode {
+  const set = new Set(files.map((p) => p.replace(/\\/g, "/")));
+  if (set.has("package.json") || set.has("vite.config.ts") || set.has("tailwind.config.js")) {
+    return "vite-react-ts-tailwind";
+  }
+  return "static-html-css-js";
+}
+
+function getProjectSnapshot(files: string[], getFileContent: (path: string) => string | undefined): string {
+  const normalized = files.map((p) => p.replace(/\\/g, "/"));
+  const set = new Set(normalized);
+
+  const priority = [
+    "README.md",
+    "package.json",
+    "index.html",
+    "vite.config.ts",
+    "tailwind.config.js",
+    "postcss.config.js",
+    "tsconfig.json",
+    "src/main.tsx",
+    "src/App.tsx",
+    "src/index.css",
+    "src/styles/globals.css",
+    // common components
+    "src/components/Header.tsx",
+    "src/components/Hero.tsx",
+    "src/components/FeatureGrid.tsx",
+    "src/components/Footer.tsx",
+    // static fallback
+    "styles.css",
+    "script.js",
+  ];
+
+  const picked: string[] = [];
+  for (const p of priority) {
+    if (set.has(p)) picked.push(p);
+  }
+  // Add a few extra component files if present
+  for (const p of normalized) {
+    if (picked.length >= 14) break;
+    if (!picked.includes(p) && p.startsWith("src/components/") && p.endsWith(".tsx")) {
+      picked.push(p);
+    }
+  }
+
+  const header = `FILES (${normalized.length}):\n${normalized.sort().join("\n")}\n\n`;
+
+  const MAX_TOTAL = 35_000;
+  const MAX_PER_FILE = 5_000;
+  let out = header;
+  for (const p of picked) {
+    if (out.length >= MAX_TOTAL) break;
+    const content = getFileContent(p) ?? "";
+    const clipped = content.length > MAX_PER_FILE ? content.slice(0, MAX_PER_FILE) + "\n/* ...truncated... */\n" : content;
+    out += `--- ${p} ---\n${clipped}\n\n`;
+  }
+
+  if (out.length > MAX_TOTAL) {
+    out = out.slice(0, MAX_TOTAL) + "\n/* ...snapshot truncated... */\n";
+  }
+  return out;
+}
+
+function getSelfCritiquePrompt(jobPrompt: string, projectSnapshot: string): string {
+  return `
+You are reviewing a front-end hackathon submission before final packaging.
+
+Your job is to criticize the current project harshly but constructively.
+
+Focus on:
+1. Visual hierarchy
+2. Spacing consistency
+3. Responsiveness
+4. CTA clarity
+5. Interaction quality
+6. Accessibility
+7. Missing states (loading, empty, success, error)
+8. Any placeholder/demo-looking content
+9. Whether the app feels complete and polished
+10. Whether it matches the user's prompt well
+
+Original prompt:
+${jobPrompt}
+
+Project snapshot:
+${projectSnapshot}
+
+Return:
+- a score out of 10
+- top 5 issues
+- exact file-level fixes to make
+- prioritize the fixes that most improve design and functionality quickly
+`.trim();
+}
+
+function getUiJudgePrompt(jobPrompt: string, projectSnapshot: string): string {
+  return `
+You are an unforgiving hackathon design and UX judge.
+
+Review the current project as if deciding whether it deserves to beat other finalists.
+
+Be blunt.
+Do not praise weak work.
+Assume the first version is not good enough.
+
+Judge on:
+- Functionality
+- Design
+- Speed-feel / simplicity
+- Coherence
+- Completeness
+
+Original prompt:
+${jobPrompt}
+
+Project snapshot:
+${projectSnapshot}
+
+Return STRICT JSON only (no markdown, no trailing commas):
+{
+  "score": number,
+  "issues": [
+    {
+      "title": string,
+      "severity": "high" | "medium" | "low",
+      "fix": string,
+      "files": string[]
+    }
+  ],
+  "summary": string
+}
+`.trim();
+}
+
+function getRepairPrompt(jobPrompt: string, critique: string): string {
+  return `
+You are improving an existing front-end hackathon project.
+
+Original prompt:
+${jobPrompt}
+
+Critique:
+${critique}
+
+Now make the highest-impact improvements only.
+
+Rules:
+- Keep the project runnable
+- Do not bloat the scope
+- Prioritize polish, responsiveness, CTA clarity, spacing, accessibility, and completeness
+- Improve existing files instead of unnecessary rewrites
+- Ensure the UI feels premium and intentional
+- Keep the design coherent
+
+Implementation requirement:
+- Use create_file to OVERWRITE only the specific files you are changing.
+- Prefer changing 3–6 files max.
+`.trim();
+}
+
+type UiJudgeJson = {
+  score: number;
+  issues: Array<{
+    title: string;
+    severity: "high" | "medium" | "low";
+    fix: string;
+    files: string[];
+  }>;
+  summary: string;
+};
+
+function tryParseJudgeJson(text: string): UiJudgeJson | null {
+  try {
+    return JSON.parse(text) as UiJudgeJson;
+  } catch {
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+      const slice = text.slice(start, end + 1);
+      try {
+        return JSON.parse(slice) as UiJudgeJson;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
 }
 
 interface TypedEventEmitter {
@@ -63,7 +254,8 @@ Rules:
 - Avoid unnecessary dependencies.
 - When requirements are ambiguous, infer the most useful product structure and continue.
 - Always include a README with setup instructions and assumptions.
-- Before finalizing, run submission_guard; fix any errors; then finalize_project.
+- Before finalizing any project, perform one self-critique pass as a strict hackathon judge. Identify the most important design and UX weaknesses, apply focused improvements, then rerun submission_guard. Prefer targeted refinement over full rewrites.
+- Do NOT call finalize_project. Create/overwrite files with create_file only; packaging + upload happens after the review pass.
 - Deliver a runnable zipped project.
 
 Winning workflow — follow this sequence for every mystery prompt that asks for a frontend:
@@ -87,7 +279,7 @@ Phase 3 — Build
 
 Phase 4 — Harden
 - Call submission_guard with your projectMode. Fix any reported errors (missing files, TODO/lorem).
-- Then call finalize_project with a short name (e.g. "submission") to zip and complete.
+- Stop after submission_guard passes. Do NOT zip inside the model.
 
 Default templates (use these mental models):
 - landing_page: hero, features, testimonials/stats, CTA, footer.
@@ -536,66 +728,67 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
         usage,
       });
 
-      // Check if a project was built
-      if (result.projectBuild && result.projectBuild.success) {
-        const { projectBuild } = result;
+      // If the model created files, run guard → judge → (optional) repair → guard → zip → upload → submit
+      const builder = llm.getActiveProjectBuilder();
+      const builtFiles = builder?.getFiles() ?? [];
 
-        this.emitEvent({
-          type: "project_built",
-          job,
-          files: projectBuild.files,
-          zipPath: projectBuild.zipPath,
+      if (builder && builtFiles.length > 0) {
+        const projectMode = inferProjectMode(builtFiles);
+
+        // Guard pass 1 (code-side, deterministic)
+        const firstGuard = runSubmissionGuard(builder, projectMode);
+        const snapshot = getProjectSnapshot(builtFiles, (p) => builder.getFileContent(p));
+
+        // Strict judge pass (no tools, preserve builder)
+        const judgeResult = await llm.generate({
+          systemPrompt: "You are BlindSprint's design and UX judge. Return strict JSON only.",
+          prompt: getUiJudgePrompt(job.prompt, snapshot),
+          tools: false,
+          temperature: 0.2,
+          maxTokens: 1200,
+          preserveProjectBuilder: true,
         });
 
-        try {
-          // Upload the zip file
-          this.emitEvent({
-            type: "files_uploading",
-            job,
-            fileCount: 1,
+        const judgeJson = tryParseJudgeJson(judgeResult.text);
+        const judgeScore = judgeJson?.score ?? 0;
+
+        const shouldRepair =
+          !firstGuard.passed ||
+          firstGuard.warnings.length > 0 ||
+          judgeScore < 8;
+
+        let finalGuard = firstGuard;
+        let finalText = result.text;
+
+        if (shouldRepair) {
+          const critiqueText =
+            judgeJson
+              ? JSON.stringify(judgeJson, null, 2)
+              : getSelfCritiquePrompt(job.prompt, snapshot);
+
+          const repairResult = await llm.generate({
+            systemPrompt: getBlindSprintSystemPrompt(effectiveBudget, job) + "\n\nYou are in REPAIR MODE. Apply only targeted edits.",
+            prompt: getRepairPrompt(job.prompt, critiqueText) + "\n\n(For reference) Current snapshot:\n" + snapshot,
+            tools: true,
+            temperature: 0.4,
+            maxTokens: 3500,
+            preserveProjectBuilder: true,
           });
 
-          const uploadedFiles = await this.client.uploadFile(projectBuild.zipPath);
+          finalText = repairResult.text || finalText;
+          finalGuard = runSubmissionGuard(builder, projectMode);
+        }
 
-          this.emitEvent({
-            type: "files_uploaded",
-            job,
-            files: [uploadedFiles],
-          });
+        if (!finalGuard.passed) {
+          // If still failing after one repair pass, submit text-only with guard errors
+          const failureText =
+            (finalText || "Project build attempted, but failed final submission checks.") +
+            `\n\nSubmission guard errors:\n- ${finalGuard.errors.join("\n- ")}\n` +
+            (finalGuard.warnings.length > 0 ? `\nWarnings:\n- ${finalGuard.warnings.join("\n- ")}\n` : "");
 
-          // Submit response with file attachment
-          let submitResult;
-          if (useV2Submit) {
-            submitResult = await this.client.submitResponseV2(
-              job.id, result.text, "FILE", [uploadedFiles]
-            );
-          } else {
-            submitResult = await this.client.submitResponseWithFiles(job.id, {
-              content: result.text,
-              responseType: "FILE",
-              files: [uploadedFiles],
-            });
-          }
-
-          this.emitEvent({
-            type: "response_submitted",
-            job,
-            responseId: submitResult.response.id,
-            hasFiles: true,
-          });
-
-          // Cleanup project files
-          cleanupProject(projectBuild.projectDir, projectBuild.zipPath);
-        } catch (uploadError) {
-          // If upload fails, fall back to text-only response
-          logger.error("Failed to upload project files, submitting text-only response:", uploadError);
-
-          let submitResult;
-          if (useV2Submit) {
-            submitResult = await this.client.submitResponseV2(job.id, result.text);
-          } else {
-            submitResult = await this.client.submitResponse(job.id, result.text);
-          }
+          const submitResult = useV2Submit
+            ? await this.client.submitResponseV2(job.id, failureText)
+            : await this.client.submitResponse(job.id, failureText);
 
           this.emitEvent({
             type: "response_submitted",
@@ -604,17 +797,64 @@ export class AgentRunner extends EventEmitter implements TypedEventEmitter {
             hasFiles: false,
           });
 
-          // Still cleanup
-          cleanupProject(projectBuild.projectDir, projectBuild.zipPath);
+          builder.cleanup();
+        } else {
+          // Zip and upload
+          const zipResult = await builder.createZip("submission.zip");
+          if (!zipResult.success) {
+            throw new Error(zipResult.error || "Failed to create zip");
+          }
+
+          this.emitEvent({
+            type: "project_built",
+            job,
+            files: zipResult.files,
+            zipPath: zipResult.zipPath,
+          });
+
+          try {
+            this.emitEvent({ type: "files_uploading", job, fileCount: 1 });
+            const uploadedFiles = await this.client.uploadFile(zipResult.zipPath);
+            this.emitEvent({ type: "files_uploaded", job, files: [uploadedFiles] });
+
+            const content = finalText || "Attached: submission.zip";
+            const submitResult = useV2Submit
+              ? await this.client.submitResponseV2(job.id, content, "FILE", [uploadedFiles])
+              : await this.client.submitResponseWithFiles(job.id, {
+                  content,
+                  responseType: "FILE",
+                  files: [uploadedFiles],
+                });
+
+            this.emitEvent({
+              type: "response_submitted",
+              job,
+              responseId: submitResult.response.id,
+              hasFiles: true,
+            });
+
+            cleanupProject(zipResult.projectDir, zipResult.zipPath);
+          } catch (uploadError) {
+            logger.error("Failed to upload project files, submitting text-only response:", uploadError);
+            const submitResult = useV2Submit
+              ? await this.client.submitResponseV2(job.id, finalText || "Submission upload failed.")
+              : await this.client.submitResponse(job.id, finalText || "Submission upload failed.");
+
+            this.emitEvent({
+              type: "response_submitted",
+              job,
+              responseId: submitResult.response.id,
+              hasFiles: false,
+            });
+
+            cleanupProject(zipResult.projectDir, zipResult.zipPath);
+          }
         }
       } else {
         // Text-only response
-        let submitResult;
-        if (useV2Submit) {
-          submitResult = await this.client.submitResponseV2(job.id, result.text);
-        } else {
-          submitResult = await this.client.submitResponse(job.id, result.text);
-        }
+        const submitResult = useV2Submit
+          ? await this.client.submitResponseV2(job.id, result.text)
+          : await this.client.submitResponse(job.id, result.text);
 
         this.emitEvent({
           type: "response_submitted",
