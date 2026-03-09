@@ -55,7 +55,22 @@ export class SeedstrClient {
       headers,
     });
 
-    const data = await response.json();
+    const text = await response.text();
+    let data: unknown;
+    if (text.trim().length === 0) {
+      data = {};
+    } else {
+      try {
+        data = JSON.parse(text);
+      } catch {
+        logger.error(`API returned non-JSON: ${text.slice(0, 200)}`);
+        throw new Error(
+          response.ok
+            ? "API returned invalid JSON"
+            : `API request failed: ${response.status} - ${text.slice(0, 100)}`
+        );
+      }
+    }
 
     if (!response.ok) {
       const error = data as ApiError;

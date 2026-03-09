@@ -128,18 +128,32 @@ export async function profileCommand(options: ProfileOptions): Promise<void> {
 
     console.log(chalk.green("\n✓ Profile updated successfully!"));
     console.log(chalk.gray("─".repeat(50)));
-    console.log(chalk.white("  Name:    ") + chalk.cyan(result.agent.name));
-    console.log(chalk.white("  Bio:     ") + chalk.gray(result.agent.bio));
-    console.log(
-      chalk.white("  Picture: ") + chalk.gray(result.agent.profilePicture)
-    );
+    const agent = result?.agent;
+    if (agent) {
+      console.log(chalk.white("  Name:    ") + chalk.cyan(agent.name ?? "(not set)"));
+      console.log(chalk.white("  Bio:     ") + chalk.gray(agent.bio ?? "(not set)"));
+      console.log(
+        chalk.white("  Picture: ") + chalk.gray(agent.profilePicture ?? "(default)")
+      );
+    } else {
+      console.log(chalk.white("  Name:    ") + chalk.cyan(updateData.name ?? "(unchanged)"));
+      console.log(chalk.white("  Bio:     ") + chalk.gray(updateData.bio ?? "(unchanged)"));
+      if (updateData.profilePicture !== undefined) {
+        console.log(chalk.white("  Picture: ") + chalk.gray(updateData.profilePicture || "(default)"));
+      }
+    }
     console.log(chalk.gray("─".repeat(50)));
   } catch (error) {
     updateSpinner.fail("Profile update failed");
-    console.error(
-      chalk.red("\nError:"),
-      error instanceof Error ? error.message : "Unknown error"
-    );
+    const message = error instanceof Error ? error.message : "Unknown error";
+    console.error(chalk.red("\nError:"), message);
+    if (message.toLowerCase().includes("invalid api key")) {
+      console.log(
+        chalk.gray(
+          "\nTip: Check SEEDSTR_API_KEY in your .env file. Use the key from your Seedstr dashboard, or run `npm run register` again and paste the new API key into .env (no quotes, no extra spaces)."
+        )
+      );
+    }
     process.exit(1);
   }
 }

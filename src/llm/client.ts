@@ -6,6 +6,11 @@ import { logger } from "../utils/logger.js";
 import { webSearch, type WebSearchResult } from "../tools/webSearch.js";
 import { calculator, type CalculatorResult } from "../tools/calculator.js";
 import { ProjectBuilder, type ProjectFile, type ProjectBuildResult } from "../tools/projectBuilder.js";
+import { classifyPrompt } from "../tools/classifyPromptTool.js";
+import { planUi } from "../tools/planUiTool.js";
+import { designSystem } from "../tools/designSystemTool.js";
+import { scaffoldProject, type ScaffoldMode } from "../tools/scaffoldProjectTool.js";
+import { runSubmissionGuard, type ProjectMode } from "../tools/submissionGuardTool.js";
 
 // Errors that are worth retrying (usually transient LLM output issues)
 const RETRYABLE_ERROR_PATTERNS = [
@@ -194,6 +199,93 @@ export class LLMClient {
       });
     }
 
+    // BlindSprint: front-end competition tools (always on for job flow)
+    tools.classify_prompt = tool({
+      description:
+        "Classify a hackathon/mystery prompt into the best frontend project type. Call this first. Returns appType (landing_page|dashboard|workflow_app|marketplace|portfolio_brand|interactive_tool), audience, keyFeatures, visualTone, mustHaveInteractions.",
+      parameters: z.object({
+        prompt: z.string().describe("The raw mystery prompt from the job"),
+      }),
+      execute: async ({ prompt }) => {
+        logger.tool("classify_prompt", "start", "Classifying prompt");
+        const result = classifyPrompt(prompt);
+        logger.tool("classify_prompt", "success", result.appType);
+        return result;
+      },
+    });
+
+    tools.plan_ui = tool({
+      description:
+        "Generate a UI build plan from app type: page structure, sections, nav model, responsive behavior, design tokens, acceptance checklist. Call after classify_prompt.",
+      parameters: z.object({
+        appType: z
+          .enum([
+            "landing_page",
+            "dashboard",
+            "workflow_app",
+            "marketplace",
+            "portfolio_brand",
+            "interactive_tool",
+          ])
+          .describe("Output from classify_prompt"),
+        promptHint: z.string().optional().describe("Optional hint from the prompt"),
+      }),
+      execute: async ({ appType, promptHint }) => {
+        logger.tool("plan_ui", "start", appType);
+        const result = planUi(appType, promptHint);
+        logger.tool("plan_ui", "success", `${result.sections.length} sections`);
+        return result;
+      },
+    });
+
+    tools.design_system = tool({
+      description:
+        "Get a coherent design system: color palette, typography, spacing, radius/shadows, component variants. Use to keep the UI consistent.",
+      parameters: z.object({
+        tone: z
+          .enum(["default", "premium", "minimal"])
+          .optional()
+          .describe("Visual tone; default is modern professional"),
+      }),
+      execute: async ({ tone }) => {
+        logger.tool("design_system", "start", tone ?? "default");
+        const result = designSystem(tone ?? "default");
+        return result;
+      },
+    });
+
+    tools.scaffold_project = tool({
+      description:
+        "Get the file tree for the chosen template. Default: vite-react-ts-tailwind. Fallback for tiny prompts: static-html-css-js. Call before create_file to know which files to create.",
+      parameters: z.object({
+        mode: z
+          .enum(["vite-react-ts-tailwind", "static-html-css-js"])
+          .describe("Project mode from classify/plan"),
+      }),
+      execute: async ({ mode }) => {
+        logger.tool("scaffold_project", "start", mode);
+        const result = scaffoldProject(mode as ScaffoldMode);
+        logger.tool("scaffold_project", "success", `${result.files.length} files`);
+        return result;
+      },
+    });
+
+    tools.submission_guard = tool({
+      description:
+        "Last-pass check before finalize_project: entry point, package.json (React), README, no TODO/lorem/placeholder. Call after all create_file calls, before finalize_project. Fix any errors it reports.",
+      parameters: z.object({
+        projectMode: z
+          .enum(["vite-react-ts-tailwind", "static-html-css-js"])
+          .describe("Same mode used for scaffold_project"),
+      }),
+      execute: async ({ projectMode }) => {
+        logger.tool("submission_guard", "start", projectMode);
+        const result = runSubmissionGuard(getActiveBuilder(), projectMode as ProjectMode);
+        logger.tool("submission_guard", result.passed ? "success" : "error", result.summary);
+        return result;
+      },
+    });
+
     if (config.tools.codeInterpreterEnabled) {
       tools.code_analysis = tool({
         description:
@@ -222,12 +314,12 @@ export class LLMClient {
 
       // Project builder tool - creates files that will be packaged into a zip
       tools.create_file = tool({
-        description: `Create a file for a deliverable code project (website, app, script, tool). Only use this when the job is asking for an actual downloadable project — NOT for text-based requests like writing tweets, emails, essays, or answers. Call multiple times for multi-file projects, then use finalize_project to package them.`,
+        description: `Create a file for a deliverable frontend project. Use for websites, apps, dashboards, landing pages. Prefer Vite + React + Tailwind: create index.html, package.json, vite.config.ts, tailwind.config.js, src/main.tsx, src/App.tsx, src/index.css, src/components/*.tsx, README.md. Only use for actual code projects — NOT for text-only requests (tweets, emails, etc.). Call multiple times for each file, then finalize_project.`,
         parameters: z.object({
           path: z
             .string()
             .describe(
-              "The file path relative to the project root (e.g., 'index.html', 'src/App.tsx', 'styles/main.css')"
+              "File path relative to project root (e.g. 'index.html', 'src/App.tsx', 'src/components/Header.tsx', 'package.json')"
             ),
           content: z
             .string()
@@ -261,7 +353,7 @@ export class LLMClient {
       });
 
       tools.finalize_project = tool({
-        description: `Package all files created with create_file into a downloadable zip. Call this after creating all project files. Only use when you've built a real code project.`,
+        description: `Package all files created with create_file into a zip (submission.zip). Call after creating the full Vite+React+Tailwind project (index.html, package.json, src/*, README.md). Use a short project name (e.g. 'submission').`,
         parameters: z.object({
           projectName: z
             .string()

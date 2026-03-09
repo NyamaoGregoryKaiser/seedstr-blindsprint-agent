@@ -78,6 +78,14 @@ export class ProjectBuilder {
   }
 
   /**
+   * Get content of a file by relative path (for submission guard checks)
+   */
+  getFileContent(relativePath: string): string | undefined {
+    const normalized = relativePath.replace(/\\/g, "/");
+    return this.files.get(normalized);
+  }
+
+  /**
    * Get the project directory path
    */
   getProjectDir(): string {
